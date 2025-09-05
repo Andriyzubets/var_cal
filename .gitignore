@@ -1,3 +1,4 @@
 goo.json
 .env
 /venv
+.state.json
