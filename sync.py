@@ -22,6 +22,22 @@ def _load_state():
     except Exception:
         return {}
 
+
+# --- Config ---
+def get_target_calendar_ids():
+    ids = []
+    csv = os.getenv("TARGET_CALENDAR_IDS")
+    if csv:
+        ids.extend([x.strip() for x in csv.split(",") if x.strip()])
+    else:
+        for key in ("TARGET_CALENDAR_ID", "TARGET_CALENDAR_ID2", "TARGET_CALENDAR_ID3"):
+            v = os.getenv(key)
+            if v:
+                ids.append(v)
+    assert ids, "At least one TARGET_CALENDAR_ID must be set"
+    return ids
+
+
 def _save_state(d):
     tmp = STATE_FILE + ".tmp"
     with open(tmp, "w") as f:
@@ -104,8 +120,8 @@ def normalize_dt(value, src_tzid=None, target_tz=None):
 
     if isinstance(value, datetime.date) and not isinstance(value, datetime.datetime):
         # all-day
-        return True, datetime.datetime.combine(value, datetime.time(0, 0)).replace(
-            tzinfo=target
+        return True, target.localize(
+            datetime.datetime.combine(value, datetime.time(0, 0))
         )
 
     dt = value
@@ -133,22 +149,18 @@ def event_fingerprint(
     return hashlib.md5(payload.encode("utf-8")).hexdigest()
 
 
-def gcal_list_existing(service, include_past=False):
-    """
-    Return dict: outlook_uid -> (gcal_event) для событий, созданных этим синком.
-    Если include_past=True — берём все (и прошлые), иначе только будущие.
-    """
+def gcal_list_existing(service, calendar_id, include_past=False):
     items = {}
     page_token = None
     kwargs = dict(
-        calendarId=TARGET_CALENDAR_ID,
+        calendarId=calendar_id,
         singleEvents=False,
         maxResults=2500,
         privateExtendedProperty="src=outlook_ics",
     )
     if not include_past:
         now = datetime.datetime.now(UTC).isoformat()
-        kwargs["timeMin"] = now  # только будущие
+        kwargs["timeMin"] = now
     while True:
         resp = service.events().list(pageToken=page_token, **kwargs).execute()
         for ev in resp.get("items", []):
@@ -160,6 +172,7 @@ def gcal_list_existing(service, include_past=False):
         if not page_token:
             break
     return items
+
 
 def map_tzid(src_tzid: str | None) -> str:
     if not src_tzid:
@@ -301,65 +314,38 @@ def to_gcal_resource(vevent: Event):
     return uid, resource
 
 
-def cleanup_cancelled_overrides(svc, base_uid: str, days_back=365, days_fwd=730):
-    """
-    Удаляем отменённые (status=cancelled) экземпляры серии с данным iCalUID,
-    чтобы вхождения снова появились из мастера.
-
-    Ищем ТОЛЬКО инстансы (singleEvents=True) в разумном окне времени.
-    """
-    now_utc = datetime.datetime.now(UTC)
-    time_min = (now_utc - datetime.timedelta(days=days_back)).isoformat()
-    time_max = (now_utc + datetime.timedelta(days=days_fwd)).isoformat()
-
+def cleanup_cancelled_overrides(svc, calendar_id: str, base_uid: str):
     page_token = None
-    found = 0
     while True:
         resp = (
             svc.events()
             .list(
-                calendarId=TARGET_CALENDAR_ID,
+                calendarId=calendar_id,
                 iCalUID=base_uid,
-                showDeleted=True,  # видеть cancelled
-                singleEvents=True,  # развернуть инстансы
-                timeMin=time_min,
-                timeMax=time_max,
+                showDeleted=True,
                 maxResults=2500,
                 pageToken=page_token,
+                singleEvents=False,
             )
             .execute()
         )
-
         for ev in resp.get("items", []):
             if ev.get("status") == "cancelled":
-                ev_id = ev["id"]
                 try:
                     svc.events().delete(
-                        calendarId=TARGET_CALENDAR_ID,
-                        eventId=ev_id,
+                        calendarId=calendar_id,
+                        eventId=ev["id"],
                     ).execute()
-                    print(
-                        "CLEANED cancelled override:",
-                        ev_id,
-                        ev.get("originalStartTime"),
-                    )
-                    found += 1
+                    print(f"[{calendar_id}] CLEANED cancelled override:", ev.get("id"))
                 except Exception as e:
-                    print("FAILED to clean cancelled override:", ev_id, e)
-
+                    print(
+                        f"[{calendar_id}] FAILED to clean cancelled override:",
+                        ev.get("id"),
+                        e,
+                    )
         page_token = resp.get("nextPageToken")
         if not page_token:
             break
-
-    if found == 0:
-        print(
-            "No cancelled overrides found for",
-            base_uid,
-            "in window",
-            time_min,
-            "->",
-            time_max,
-        )
 
 
 def cleanup_cancelled_overrides_by_event_id(
@@ -422,7 +408,8 @@ def cleanup_cancelled_overrides_by_event_id(
 
 
 def main():
-    assert ICS_URL and TARGET_CALENDAR_ID, "ICS_URL and TARGET_CALENDAR_ID must be set"
+    assert ICS_URL, "ICS_URL must be set"
+    cal_ids = get_target_calendar_ids()
     svc = gcal_service()
 
     # --- 1) Load prev state & conditional headers ---
@@ -436,13 +423,11 @@ def main():
     # --- 2) Fetch ICS (try conditional first) ---
     r = requests.get(ICS_URL, headers=headers, timeout=30)
     if r.status_code == 304:
-        # Даже если сервер говорит "не изменилось", нам нужно актуальное содержимое,
-        # чтобы восстановить удалённые вручную события и вообще сверить состояние.
         r = requests.get(ICS_URL, timeout=30)
     r.raise_for_status()
     content = r.content
 
-    # --- 3) Save new state (но НЕ выходим по "hash unchanged") ---
+    # --- 3) Save state (без раннего выхода по hash) ---
     curr_hash = hashlib.md5(content).hexdigest()
     new_state = {
         "etag": r.headers.get("ETag"),
@@ -456,16 +441,12 @@ def main():
     now = datetime.datetime.now(TZ)
     cutoff = now - datetime.timedelta(days=PAST_DAYS)
 
-    # --- 5) Build source map:
-    #     - master RRULE (без RECURRENCE-ID) — всегда
-    #     - overridden (с RECURRENCE-ID) — если start >= cutoff
-    #     - одиночные — только будущее (start >= now)
+    # --- 5) Build source map (твоя логика фильтра остаётся) ---
     src = {}
     for comp in cal.walk("VEVENT"):
         dtstart = comp.get("DTSTART")
         if not dtstart:
             continue
-
         dtstart_tzid = (
             dtstart.params.get("TZID") if hasattr(dtstart, "params") else None
         )
@@ -475,9 +456,9 @@ def main():
         has_recur_id = comp.get("RECURRENCE-ID") is not None
 
         if has_rrule and not has_recur_id:
-            keep = True
+            keep = True  # master серии — всегда
         elif has_recur_id:
-            keep = start_dt >= cutoff
+            keep = start_dt >= cutoff  # overrides — не старее cutoff
         else:
             keep = start_dt >= now  # одиночные — только будущее
 
@@ -487,47 +468,47 @@ def main():
         uid, resource = to_gcal_resource(comp)
         src[uid] = resource
 
-    # --- 6) Read existing (включая прошлые), только "наши" события по privateExtendedProperty ---
-    existing = gcal_list_existing(svc, include_past=True)
+    # --- 6) По каждому целевому календарю — upsert + cleanup ---
+    for CAL_ID in cal_ids:
+        print(f"\n=== Sync to {CAL_ID} ===")
+        existing = gcal_list_existing(svc, CAL_ID, include_past=True)
 
-    # --- 7) Upsert ---
-    for uid, res in src.items():
-        try:
-            ex = existing.get(uid)
-            is_master = ("recurrence" in res) and ("::" not in uid)  # мастер серии
+        # Upsert
+        for uid, res in src.items():
+            try:
+                ex = existing.get(uid)
+                is_master = ("recurrence" in res) and ("::" not in uid)
+                base_uid = uid.split("::", 1)[0]
 
-            if ex:
-                old_fp = ex.get("extendedProperties", {}).get("private", {}).get("fp")
-                if old_fp != res["extendedProperties"]["private"]["fp"]:
-                    if "recurrence" in res:
-                        print("PATCH RECURRENCE ->", res["recurrence"])
-                    patched = (
-                        svc.events()
-                        .patch(calendarId=TARGET_CALENDAR_ID, eventId=ex["id"], body=res)
-                        .execute()
+                if ex:
+                    old_fp = (
+                        ex.get("extendedProperties", {}).get("private", {}).get("fp")
                     )
+                    if old_fp != res["extendedProperties"]["private"]["fp"]:
+                        if "recurrence" in res:
+                            print(f"[{CAL_ID}] PATCH RECURRENCE ->", res["recurrence"])
+                        svc.events().patch(
+                            calendarId=CAL_ID, eventId=ex["id"], body=res
+                        ).execute()
+                        if is_master:
+                            cleanup_cancelled_overrides(svc, CAL_ID, base_uid)
+                else:
+                    if "recurrence" in res:
+                        print(f"[{CAL_ID}] INSERT RECURRENCE ->", res["recurrence"])
+                    svc.events().insert(calendarId=CAL_ID, body=res).execute()
                     if is_master:
-                        cleanup_cancelled_overrides_by_event_id(svc, patched["id"])
-            else:
+                        cleanup_cancelled_overrides(svc, CAL_ID, base_uid)
+            except Exception:
+                print(f"[{CAL_ID}] FAILED UID:", uid)
                 if "recurrence" in res:
-                    print("INSERT RECURRENCE ->", res["recurrence"])
-                created = (
-                    svc.events().insert(calendarId=TARGET_CALENDAR_ID, body=res).execute()
-                )
-                if is_master:
-                    cleanup_cancelled_overrides_by_event_id(svc, created["id"])
-        except Exception:
-            print("FAILED UID:", uid)
-            if "recurrence" in res:
-                print("RECURRENCE LINES:", res.get("recurrence"))
-            raise
+                    print("RECURRENCE LINES:", res.get("recurrence"))
+                raise
 
-    # --- 8) Delete everything we no longer want ---
-    for uid, ex in existing.items():
-        if uid not in src:
-            svc.events().delete(
-                calendarId=TARGET_CALENDAR_ID, eventId=ex["id"]
-            ).execute()
+        # Delete, чего нет в src
+        for uid, ex in existing.items():
+            if uid not in src:
+                svc.events().delete(calendarId=CAL_ID, eventId=ex["id"]).execute()
+
 
 if __name__ == "__main__":
     main()
