@@ -9,6 +9,7 @@ from icalendar import Calendar, Event
 from googleapiclient.discovery import build
 from google.oauth2 import service_account
 from pytz import timezone, UTC
+from pytz.exceptions import UnknownTimeZoneError
 
 load_dotenv(dotenv_path=pathlib.Path(__file__).with_name(".env"))
 
@@ -56,6 +57,7 @@ WINDOWS_TZMAP = {
     "W. Europe Standard Time": "Europe/Berlin",
     "Central European Standard Time": "Europe/Warsaw",
     "FLE Standard Time": "Europe/Helsinki",
+    "GTB Standard Time": "Europe/Bucharest",
 }
 
 
@@ -112,11 +114,7 @@ def normalize_dt(value, src_tzid=None, target_tz=None):
     Return (is_all_day, aware_dt_in_target_tz).
     Если target_tz не задан, используем глобальный TZ (Europe/Paris).
     """
-    target = (
-        timezone(map_tzid(target_tz))
-        if isinstance(target_tz, str)
-        else (target_tz or TZ)
-    )
+    target = resolve_tz(target_tz) if isinstance(target_tz, str) else (target_tz or TZ)
 
     if isinstance(value, datetime.date) and not isinstance(value, datetime.datetime):
         # all-day
@@ -126,7 +124,7 @@ def normalize_dt(value, src_tzid=None, target_tz=None):
 
     dt = value
     if dt.tzinfo is None:
-        src = timezone(map_tzid(src_tzid)) if src_tzid else target
+        src = resolve_tz(src_tzid) if src_tzid else target
         dt = src.localize(dt)
     return False, dt.astimezone(target)
 
@@ -180,6 +178,18 @@ def map_tzid(src_tzid: str | None) -> str:
     return WINDOWS_TZMAP.get(src_tzid, src_tzid)
 
 
+def resolve_tz(tzid: str | None):
+    mapped = map_tzid(tzid)
+    try:
+        return timezone(mapped)
+    except UnknownTimeZoneError:
+        print(
+            f"WARN: unknown timezone {tzid!r} mapped to {mapped!r}; "
+            f"falling back to {TIMEZONE!r}"
+        )
+        return TZ
+
+
 def build_rrule_string(rrule_dict):
     parts = []
     for k in sorted(rrule_dict.keys(), key=str.upper):
@@ -218,7 +228,8 @@ def to_gcal_resource(vevent: Event):
         dtstart_prop.params.get("TZID") if hasattr(dtstart_prop, "params") else None
     )
     event_tzid = map_tzid(dtstart_tzid_raw)  # <-- IANA для этого события
-    event_tz = timezone(event_tzid)
+    event_tz = resolve_tz(event_tzid)
+    event_tzid = getattr(event_tz, "zone", TIMEZONE)
 
     allday_start, start_dt_local = normalize_dt(
         dtstart_prop.dt, dtstart_tzid_raw, event_tz
