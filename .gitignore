@@ -2,3 +2,5 @@ goo.json
 .env
 /venv
 .state.json
+.block_state.json
+block.log
