@@ -458,6 +458,9 @@ def main():
         dtstart = comp.get("DTSTART")
         if not dtstart:
             continue
+        # наши же блоки из block.py — обратно в Google не тянем
+        if str(comp.get("UID", "")).endswith("@var-cal"):
+            continue
         dtstart_tzid = (
             dtstart.params.get("TZID") if hasattr(dtstart, "params") else None
         )
